@@ -21,7 +21,7 @@ Illustrated Assembly Tutorial
 STEP 1: Assemble expansion board
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-**Parts list：** Expansion board、Acrylic body panel、M3*10mm screw(4 PCS)、M3*16mm copper pillar(4 PCS).
+**Parts list：** Expansion board、Acrylic body panel、M3*10mm screw(4 PCS)、M3*25mm copper pillar(4 PCS).
 
 .. image:: _static/AssemblyTutorial/2.8266.png
    :width: 800
