@@ -1,0 +1,3 @@
+# Only the Emotiv (mental-command) path needs this.
+# The browser control panel and UDP sender use the Python standard library.
+websocket-client>=1.0

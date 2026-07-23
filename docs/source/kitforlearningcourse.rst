@@ -845,3 +845,694 @@ Achieved Effect
 
 ----
 
+
+Course 7：Emotiv EPOC X Mind Control
+------------------------------------
+
+In this lesson, we control the spider robot with an **Emotiv EPOC X** EEG headset, and with a
+control panel in your web browser. The headset cannot talk to the ESP8266 directly, so a small
+Python program on your computer acts as a bridge: it reads Emotiv **mental commands** (via the
+EMOTIV Cortex service) *and* serves a local web page with buttons, then forwards a single
+character to the ESP8266 over Wi-Fi (UDP). The robot turns that character into a gait.
+
+Because both the browser buttons and the mental commands go through the same channel, you can
+verify the whole robot with the buttons first, then add the headset.
+
+.. note::
+
+ Full, ready-to-run copies of both programs live in the repository under
+ ``emotiv_control/`` (``firmware/emotiv_spider/emotiv_spider.ino`` and
+ ``bridge/emotiv_bridge.py``), together with a README covering the Emotiv Cortex app,
+ mental-command training, and troubleshooting.
+
+----
+
+Wiring diagram
+~~~~~~~~~~~~~~
+
+- No new wiring. This lesson reuses the fully assembled 8-servo spider from Course 3
+  (servos on G14, G12, G13, G15, G16, G5, G4, G2).
+
+- The ESP8266 and the computer running the Python bridge must be on the **same Wi-Fi
+  network**.
+
+----
+
+Command reference
+~~~~~~~~~~~~~~~~~~
+
+.. list-table::
+   :header-rows: 1
+   :widths: 15 35 25 25
+
+   * - Character
+     - Robot action
+     - Button
+     - Mental command
+   * - F
+     - Walk forward
+     - ▲ Forward
+     - push
+   * - B
+     - Walk backward
+     - ▼ Back
+     - pull
+   * - L
+     - Turn left
+     - ◄ Left
+     - left
+   * - R
+     - Turn right
+     - ► Right
+     - right
+   * - S
+     - Stop (standby)
+     - ■ Stop
+     - neutral
+
+----
+
+Example code (ESP8266 — Arduino IDE)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Set your Wi-Fi ``WIFI_SSID`` / ``WIFI_PASSWORD`` near the top, flash the board, then open the
+Serial Monitor at 115200 baud to read the IP address the board was given. You will need that IP
+for the Python program.
+
+.. code-block:: cpp
+
+  /*
+   * emotiv_spider.ino  —  LAFVIN Quadruped Spider Robot
+   * ----------------------------------------------------
+   * Wi-Fi (station mode) + UDP command listener for the ESP8266.
+   *
+   * A companion program on your PC (bridge/emotiv_bridge.py) sends a single
+   * character over UDP; this firmware turns that character into a spider gait:
+   *
+   *     'F' -> walk forward       'B' -> walk backward
+   *     'L' -> turn left          'R' -> turn right
+   *     'S' -> stop (standby)
+   *
+   * The PC program can send those characters from a browser control panel
+   * (buttons) and/or from an Emotiv EPOC X mental command — this firmware does
+   * not care where the character came from.
+   *
+   * Motion engine (SERVO_PINS, ranges, Servo_Zero, the Servo_Forward matrix,
+   * init()/zero()/standby()/forward()) is reused unchanged from Course 3 of the
+   * LAFVIN documentation. The backward() and turn() gaits are added here.
+   *
+   * Board:   ESP8266 (spider expansion board)
+   * Libs:    ESP8266WiFi, WiFiUdp, Servo   (all bundled with the ESP8266 core)
+   *
+   * >>> Set your Wi-Fi SSID / PASSWORD below, flash, then open the Serial
+   *     Monitor @115200 to read the IP address the board was given. Put that IP
+   *     into bridge/config.py (ESP8266_IP).  The PC and the ESP8266 MUST be on
+   *     the same Wi-Fi network.
+   */
+
+  #include <ESP8266WiFi.h>
+  #include <WiFiUdp.h>
+  #include <Servo.h>
+  #include <Arduino.h>
+
+  // ======================= Wi-Fi / network configuration =======================
+  const char* WIFI_SSID     = "YOUR_WIFI_SSID";       // <-- change me
+  const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";   // <-- change me
+
+  const unsigned int LOCAL_UDP_PORT = 4210;           // must match UDP_PORT in config.py
+
+  WiFiUDP Udp;
+  char incomingPacket[8];                             // we only need the first byte
+
+  // ============================ Servo / motion setup ===========================
+  // (reused verbatim from Course 3)
+  const int SERVO_PINS[] = {14, 12, 13, 15, 16, 5, 4, 2};  // G14, G12, G13, G15, G16, G5, G4, G2
+  const int ALLSERVOS = 8;
+  const int ALLMATRIX = 9;   // 8 servo angles + trailing delay (ms)
+
+  // Servo pulse range (microseconds) and valid angle range
+  const int SERVOMIN = 400;
+  const int SERVOMAX = 2400;
+  const int ANGLE_MIN = 1;
+  const int ANGLE_MAX = 180;
+
+  // Servo zero position (8 angles + settle time)
+  const int Servo_Zero[] = { 135, 45, 135, 45, 45, 135, 45, 135, 500 };
+
+  // Forward motion sequence (11 steps x [8 angles + ms])
+  const int Servo_Forward_Step = 11;
+  const int Servo_Forward[][ALLMATRIX] = {
+    // G14, G12, G13, G15, G16, G5,  G4,  G2,  ms
+    {  70,  90,  90, 110, 110,  90,  90,  70, 200 }, // standby
+    {  90,  90,  90, 110, 110,  90,  45,  90, 200 }, // leg1,4 lift up
+    {  70,  90,  90, 110, 110,  90,  45,  70, 200 }, // leg1,4 put down
+    {  70,  90,  90,  90,  90,  90,  45,  70, 200 }, // leg2,3 lift up
+    {  70,  39, 141,  90,  90,  90,  90,  70, 200 }, // leg1,4 backward, leg2 forward
+    {  70,  39, 141, 110, 110,  90,  90,  70, 200 }, // leg2,3 put down
+    {  90,  90, 141, 110, 110,  90,  90,  90, 200 }, // leg1,4 lift up
+    {  90,  90,  90, 110, 110, 135,  90,  90, 200 }, // leg2,3 backward
+    {  70,  90,  90, 110, 110, 135,  90,  70, 200 }, // leg1,4 put down
+    {  70,  90,  90, 110,  90, 135,  90,  70, 200 }, // leg3 lift up
+    {  70,  90,  90, 110, 110,  90,  90,  70, 200 }, // leg3 put down forward
+  };
+
+  // ------------------------------- Turn tuning ---------------------------------
+  // The turn gaits below are DERIVED from the forward gait: we damp the stride of
+  // the legs on one side so the body curves toward that side. The exact left/right
+  // leg grouping depends on how YOUR robot is assembled. These are STARTER VALUES
+  // — expect to fine-tune them on real hardware (use the browser control panel in
+  // --ui-only mode, and the servo-calibration page in the LAFVIN docs).
+  //
+  // If "turn left" makes the robot turn right (or vice-versa), swap the two
+  // index lists below. If turns are too weak/strong, change TURN_DAMP
+  // (0.0 = spins hard in place, 1.0 = walks straight, no turn).
+  const int  LEFT_H_SERVOS[]  = {0, 2};   // horizontal servos of the left-side legs
+  const int  RIGHT_H_SERVOS[] = {4, 6};   // horizontal servos of the right-side legs
+  const int  LEFT_H_COUNT     = 2;
+  const int  RIGHT_H_COUNT    = 2;
+  const float TURN_DAMP       = 0.35;     // fraction of stride kept on the damped side
+
+  // Neutral (standby) horizontal-servo angles, used as the anchor when damping.
+  // These are the horizontal columns of Servo_Forward row 0.
+  const int Neutral_H[ALLSERVOS] = { 70, 90, 90, 110, 110, 90, 90, 70 };
+
+  // Forward-declared so the gait loops can poll for a new UDP command mid-cycle
+  // and abort early when the operator changes their mind.
+  char pollCommand(char current);
+
+  // =============================================================================
+  class SpiderBotMotion {
+  public:
+      Servo servos[ALLSERVOS];
+
+      // Attach all 8 servos
+      void init() {
+          for (int i = 0; i < ALLSERVOS; i++) {
+              servos[i].attach(SERVO_PINS[i], SERVOMIN, SERVOMAX);
+          }
+          delay(200);
+      }
+
+      // Write one row of angles (indices 0..7) then wait `ms`
+      void writeFrame(const int angles[ALLSERVOS], int ms) {
+          for (int i = 0; i < ALLSERVOS; i++) {
+              int angle = constrain(angles[i], ANGLE_MIN, ANGLE_MAX);
+              servos[i].write(angle);
+          }
+          delay(ms);
+      }
+
+      // Move all servos to the zero position
+      void zero() {
+          for (int i = 0; i < ALLSERVOS; i++) {
+              int angle = constrain(Servo_Zero[i], ANGLE_MIN, ANGLE_MAX);
+              servos[i].write(angle);
+          }
+          delay(Servo_Zero[8]);
+      }
+
+      // Standby pose (legs down, ready)
+      void standby() {
+          int standby_angles[ALLSERVOS] = {60, 90, 90, 120, 120, 90, 90, 60};
+          writeFrame(standby_angles, 500);
+      }
+
+      // ---- Forward: one full gait cycle, abortable between steps -------------
+      // Returns the command that should run next (unchanged unless a new UDP
+      // packet arrived while walking).
+      char forward(char cmd) {
+          for (int step = 0; step < Servo_Forward_Step; step++) {
+              writeFrame(Servo_Forward[step], Servo_Forward[step][8]);
+              char next = pollCommand(cmd);
+              if (next != cmd) return next;          // operator changed command
+          }
+          return cmd;
+      }
+
+      // ---- Backward: the forward keyframes walked in reverse order ----------
+      char backward(char cmd) {
+          for (int step = Servo_Forward_Step - 1; step >= 0; step--) {
+              writeFrame(Servo_Forward[step], Servo_Forward[step][8]);
+              char next = pollCommand(cmd);
+              if (next != cmd) return next;
+          }
+          return cmd;
+      }
+
+      // ---- Turn: forward gait with one side's stride damped ------------------
+      // left == true  -> damp the LEFT legs  -> body curves/pivots left
+      // left == false -> damp the RIGHT legs -> body curves/pivots right
+      char turn(bool left, char cmd) {
+          const int* damp   = left ? LEFT_H_SERVOS : RIGHT_H_SERVOS;
+          int        dampN  = left ? LEFT_H_COUNT  : RIGHT_H_COUNT;
+
+          for (int step = 0; step < Servo_Forward_Step; step++) {
+              int frame[ALLSERVOS];
+              for (int i = 0; i < ALLSERVOS; i++) frame[i] = Servo_Forward[step][i];
+
+              // Pull the damped side's horizontal servos back toward neutral so
+              // those legs take a shorter stride -> the robot turns.
+              for (int k = 0; k < dampN; k++) {
+                  int idx = damp[k];
+                  int raw = Servo_Forward[step][idx];
+                  frame[idx] = Neutral_H[idx] + (int)((raw - Neutral_H[idx]) * TURN_DAMP);
+              }
+
+              writeFrame(frame, Servo_Forward[step][8]);
+              char next = pollCommand(cmd);
+              if (next != cmd) return next;
+          }
+          return cmd;
+      }
+  };
+
+  SpiderBotMotion robot;
+
+  // Current active command; 'S' (stop/standby) at power-up.
+  char currentCmd = 'S';
+
+  // =============================================================================
+  // Read a UDP packet if one is waiting and return the (possibly new) command.
+  // Only F/B/L/R/S are accepted; anything else is ignored.
+  char pollCommand(char current) {
+      int packetSize = Udp.parsePacket();
+      if (packetSize) {
+          int len = Udp.read(incomingPacket, sizeof(incomingPacket) - 1);
+          if (len > 0) {
+              incomingPacket[len] = 0;
+              char c = incomingPacket[0];
+              if (c == 'F' || c == 'B' || c == 'L' || c == 'R' || c == 'S') {
+                  if (c != current) {
+                      Serial.printf("UDP command: %c\n", c);
+                  }
+                  return c;
+              }
+          }
+      }
+      return current;
+  }
+
+  void setup() {
+      Serial.begin(115200);
+      delay(100);
+      Serial.println("\nQuadBot (Emotiv/UDP) starting...");
+
+      // Bring up the servos and park in a known pose
+      robot.init();
+      Serial.println("Moving to zero position...");
+      robot.zero();
+      Serial.println("Standby position...");
+      robot.standby();
+
+      // Connect to Wi-Fi (station mode)
+      Serial.printf("Connecting to Wi-Fi \"%s\"", WIFI_SSID);
+      WiFi.mode(WIFI_STA);
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      while (WiFi.status() != WL_CONNECTED) {
+          delay(500);
+          Serial.print(".");
+      }
+      Serial.println();
+      Serial.print("Wi-Fi connected. ESP8266 IP address: ");
+      Serial.println(WiFi.localIP());   // <-- copy this into config.py (ESP8266_IP)
+
+      // Start listening for UDP commands
+      Udp.begin(LOCAL_UDP_PORT);
+      Serial.printf("Listening for UDP commands on port %u\n", LOCAL_UDP_PORT);
+      Serial.println("Ready. Send F/B/L/R/S from the PC bridge.");
+  }
+
+  void loop() {
+      // Pick up any newly-arrived command
+      currentCmd = pollCommand(currentCmd);
+
+      // Run one gait cycle for the active command (each returns early if the
+      // command changes mid-cycle, keeping the robot responsive).
+      switch (currentCmd) {
+          case 'F': currentCmd = robot.forward(currentCmd);      break;
+          case 'B': currentCmd = robot.backward(currentCmd);     break;
+          case 'L': currentCmd = robot.turn(true,  currentCmd);  break;
+          case 'R': currentCmd = robot.turn(false, currentCmd);  break;
+          case 'S':
+          default:
+              robot.standby();     // hold the standby pose while stopped
+              break;
+      }
+  }
+
+----
+
+Example code (PC bridge — Python)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Install the one dependency with ``pip install websocket-client``. Copy ``config.example.py`` to
+``config.py`` and set ``ESP8266_IP`` (from the Serial Monitor) plus, for mental commands, your
+Emotiv ``CLIENT_ID`` / ``CLIENT_SECRET`` / ``PROFILE_NAME``. Run
+``python emotiv_bridge.py --ui-only`` for the browser buttons alone, or
+``python emotiv_bridge.py`` to add the headset.
+
+.. code-block:: python
+
+  #!/usr/bin/env python3
+  """
+  emotiv_bridge.py  —  PC-side bridge for the LAFVIN spider robot.
+
+  Two ways to drive the spider, both funnelling through one send_command():
+
+    1. A local browser control panel (http://localhost:8080) with buttons:
+          Forward / Back / Left / Right / Stop
+       -> works WITHOUT the headset, so you can verify the Wi-Fi/UDP/servo path
+          first.
+
+    2. The Emotiv EPOC X "mental command" (com) stream, via the EMOTIV Cortex
+       service running on this same PC.
+
+  Each input becomes a single character sent over UDP to the ESP8266:
+
+          F = forward   B = backward   L = left   R = right   S = stop
+
+  Usage:
+      python emotiv_bridge.py --ui-only     # control panel only, no headset
+      python emotiv_bridge.py               # control panel + Emotiv mental commands
+
+  Setup:
+      pip install -r requirements.txt       # installs websocket-client
+      cp config.example.py config.py        # then edit config.py
+
+  Only the Emotiv path needs the third-party 'websocket-client' package;
+  the control panel and UDP sender use the Python standard library only.
+  """
+
+  import argparse
+  import json
+  import socket
+  import ssl
+  import sys
+  import threading
+  import time
+  from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+  from urllib.parse import urlparse, parse_qs
+
+  # --------------------------------------------------------------------------- #
+  # Configuration: prefer a local config.py, fall back to config.example.py.
+  # --------------------------------------------------------------------------- #
+  try:
+      import config
+  except ImportError:
+      print("ERROR: config.py not found.\n"
+            "       Copy the template and edit it:  cp config.example.py config.py")
+      sys.exit(1)
+
+  VALID_COMMANDS = {"F", "B", "L", "R", "S"}
+
+  # --------------------------------------------------------------------------- #
+  # UDP sender — the single choke point every input path goes through.
+  # --------------------------------------------------------------------------- #
+  _udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+  _last_sent = None
+  _last_sent_lock = threading.Lock()
+
+
+  def send_command(char, source=""):
+      """Send a one-character command to the ESP8266 over UDP."""
+      char = (char or "").upper()[:1]
+      if char not in VALID_COMMANDS:
+          print(f"  (ignored invalid command: {char!r})")
+          return False
+      global _last_sent
+      with _last_sent_lock:
+          _last_sent = char
+      _udp_socket.sendto(char.encode(), (config.ESP8266_IP, config.UDP_PORT))
+      tag = f" [{source}]" if source else ""
+      print(f"-> sent '{char}' to {config.ESP8266_IP}:{config.UDP_PORT}{tag}")
+      return True
+
+
+  def last_sent():
+      with _last_sent_lock:
+          return _last_sent or "-"
+
+
+  # --------------------------------------------------------------------------- #
+  # Local browser control panel (standard library only).
+  # --------------------------------------------------------------------------- #
+  CONTROL_PANEL_HTML = """<!DOCTYPE html>
+  <html lang="en">
+  <head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Spider Control</title>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box;}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+         background:#0f1115;color:#e8e8e8;min-height:100vh;display:flex;
+         flex-direction:column;justify-content:center;align-items:center;padding:20px;}
+    h1{font-weight:500;font-size:22px;margin-bottom:6px;}
+    .sub{color:#8a8f98;font-size:13px;margin-bottom:28px;}
+    .pad{display:grid;grid-template-columns:repeat(3,90px);grid-template-rows:repeat(3,90px);
+         gap:12px;}
+    button{font-size:15px;font-weight:600;color:#e8e8e8;background:#1c2230;
+           border:1px solid #2c3444;border-radius:16px;cursor:pointer;
+           transition:transform .05s,background .15s;user-select:none;}
+    button:hover{background:#26304a;}
+    button:active{transform:scale(.94);background:#3a4670;}
+    .fwd{grid-column:2;grid-row:1;}
+    .left{grid-column:1;grid-row:2;}
+    .stop{grid-column:2;grid-row:2;background:#4a1f24;border-color:#6b2b32;}
+    .stop:hover{background:#66272e;}
+    .right{grid-column:3;grid-row:2;}
+    .back{grid-column:2;grid-row:3;}
+    .status{margin-top:26px;font-size:13px;color:#8a8f98;}
+    .status b{color:#7dd3fc;font-size:15px;}
+  </style>
+  </head>
+  <body>
+    <h1>🕷️ Spider Control</h1>
+    <div class="sub">Buttons and mental commands share the same robot.</div>
+    <div class="pad">
+      <button class="fwd"   onclick="cmd('F')">▲<br>Forward</button>
+      <button class="left"  onclick="cmd('L')">◄<br>Left</button>
+      <button class="stop"  onclick="cmd('S')">■<br>Stop</button>
+      <button class="right" onclick="cmd('R')">►<br>Right</button>
+      <button class="back"  onclick="cmd('B')">▼<br>Back</button>
+    </div>
+    <div class="status">Last command: <b id="last">-</b></div>
+  <script>
+  function cmd(c){
+    fetch('/cmd?c='+c).then(r=>r.text()).then(()=>{
+      document.getElementById('last').innerText=c;
+    }).catch(e=>console.error(e));
+  }
+  // keyboard: arrow keys + space to stop
+  document.addEventListener('keydown',e=>{
+    const m={ArrowUp:'F',ArrowDown:'B',ArrowLeft:'L',ArrowRight:'R',' ':'S'};
+    if(m[e.key]){e.preventDefault();cmd(m[e.key]);}
+  });
+  </script>
+  </body>
+  </html>
+  """
+
+
+  class ControlPanelHandler(BaseHTTPRequestHandler):
+      def do_GET(self):
+          parsed = urlparse(self.path)
+          if parsed.path == "/" or parsed.path == "/index.html":
+              body = CONTROL_PANEL_HTML.encode("utf-8")
+              self.send_response(200)
+              self.send_header("Content-Type", "text/html; charset=utf-8")
+              self.send_header("Content-Length", str(len(body)))
+              self.end_headers()
+              self.wfile.write(body)
+          elif parsed.path == "/cmd":
+              params = parse_qs(parsed.query)
+              char = (params.get("c", [""])[0] or "").upper()
+              ok = send_command(char, source="ui")
+              self.send_response(200 if ok else 400)
+              self.send_header("Content-Type", "text/plain")
+              self.end_headers()
+              self.wfile.write(b"ok" if ok else b"invalid")
+          else:
+              self.send_response(404)
+              self.end_headers()
+              self.wfile.write(b"404")
+
+      def log_message(self, *args):
+          pass  # keep the console focused on command traffic
+
+
+  def start_web_ui():
+      """Start the control panel on a background thread; return the server."""
+      server = ThreadingHTTPServer(("127.0.0.1", config.UI_PORT), ControlPanelHandler)
+      t = threading.Thread(target=server.serve_forever, daemon=True)
+      t.start()
+      print(f"Control panel:  http://localhost:{config.UI_PORT}")
+      return server
+
+
+  # --------------------------------------------------------------------------- #
+  # Emotiv Cortex client (mental commands).
+  # --------------------------------------------------------------------------- #
+  class CortexClient:
+      """Minimal Cortex v2 client: authorize, session, load profile, subscribe."""
+
+      def __init__(self):
+          from websocket import create_connection  # imported lazily (only this path needs it)
+          self._create_connection = create_connection
+          self.ws = None
+          self.req_id = 0
+          self.token = None
+          self.headset = None
+          self.session = None
+
+      def _rpc(self, method, params=None):
+          self.req_id += 1
+          self.ws.send(json.dumps({
+              "jsonrpc": "2.0", "id": self.req_id,
+              "method": method, "params": params or {},
+          }))
+          # Skip any streaming/warning frames until our matching response arrives.
+          while True:
+              msg = json.loads(self.ws.recv())
+              if msg.get("id") == self.req_id:
+                  if "error" in msg:
+                      raise RuntimeError(f"{method} failed: {msg['error']}")
+                  return msg.get("result")
+
+      def connect(self):
+          print("Connecting to Cortex (wss://localhost:6868)...")
+          self.ws = self._create_connection(
+              "wss://localhost:6868",
+              sslopt={"cert_reqs": ssl.CERT_NONE},  # Cortex uses a self-signed cert
+          )
+
+          login = self._rpc("getUserLogin")
+          if not login:
+              raise RuntimeError("No user logged in. Open EMOTIV Launcher and log in first.")
+
+          self._rpc("requestAccess", {
+              "clientId": config.CLIENT_ID, "clientSecret": config.CLIENT_SECRET,
+          })
+          # First run only: approve this app in the EMOTIV Launcher when prompted.
+
+          auth = self._rpc("authorize", {
+              "clientId": config.CLIENT_ID, "clientSecret": config.CLIENT_SECRET,
+              "debit": 1,
+          })
+          self.token = auth["cortexToken"]
+
+          headsets = self._rpc("queryHeadsets")
+          if not headsets:
+              raise RuntimeError("No headset found. Turn on the EPOC X / insert the USB dongle.")
+          self.headset = headsets[0]["id"]
+          if headsets[0].get("status") == "discovered":
+              self._rpc("controlDevice", {"command": "connect", "headset": self.headset})
+              time.sleep(3)
+          print(f"Headset: {self.headset}")
+
+          sess = self._rpc("createSession", {
+              "cortexToken": self.token, "headset": self.headset, "status": "active",
+          })
+          self.session = sess["id"]
+
+          # Load the trained mental-command profile (required for real commands).
+          if config.PROFILE_NAME:
+              self._rpc("setupProfile", {
+                  "cortexToken": self.token, "headset": self.headset,
+                  "profile": config.PROFILE_NAME, "status": "load",
+              })
+              print(f"Loaded profile: {config.PROFILE_NAME}")
+          else:
+              print("WARNING: PROFILE_NAME is empty — only 'neutral' will fire until you "
+                    "train mental commands in EmotivBCI and set PROFILE_NAME.")
+
+          self._rpc("subscribe", {
+              "cortexToken": self.token, "session": self.session, "streams": ["com"],
+          })
+          print("Subscribed to mental commands ('com'). Think to move!")
+
+      def run(self):
+          """Blocking receive loop: map mental commands to robot commands."""
+          last_cmd = None
+          while True:
+              data = json.loads(self.ws.recv())
+              if "com" not in data:
+                  continue
+              action, power = data["com"][0], data["com"][1]
+              mapped = config.COMMAND_MAP.get(action)
+              if mapped is None:
+                  continue
+              # Neutral always stops; other actions must clear the power threshold.
+              if action != "neutral" and power < config.POWER_THRESHOLD:
+                  continue
+              if mapped != last_cmd:          # debounce: only send on change
+                  last_cmd = mapped
+                  send_command(mapped, source=f"com:{action} {power:.2f}")
+
+
+  # --------------------------------------------------------------------------- #
+  # Entry point.
+  # --------------------------------------------------------------------------- #
+  def main():
+      parser = argparse.ArgumentParser(description="Emotiv -> Spider robot bridge")
+      parser.add_argument("--ui-only", action="store_true",
+                          help="Run only the browser control panel (no headset).")
+      args = parser.parse_args()
+
+      print("=" * 60)
+      print("LAFVIN Spider — Emotiv / UDP bridge")
+      print(f"Robot (ESP8266): {config.ESP8266_IP}:{config.UDP_PORT}")
+      print("=" * 60)
+
+      start_web_ui()
+
+      if args.ui_only:
+          print("Mode: UI only. Open the control panel and click to drive.")
+          print("Press Ctrl+C to quit.")
+          try:
+              while True:
+                  time.sleep(1)
+          except KeyboardInterrupt:
+              print("\nBye.")
+          return
+
+      # Full mode: also connect to Emotiv Cortex.
+      try:
+          client = CortexClient()
+          client.connect()
+          client.run()
+      except KeyboardInterrupt:
+          print("\nBye.")
+      except Exception as e:
+          print(f"\nEmotiv connection error: {e}")
+          print("The control panel is still running — you can keep using the buttons.")
+          print("Press Ctrl+C to quit.")
+          try:
+              while True:
+                  time.sleep(1)
+          except KeyboardInterrupt:
+              print("\nBye.")
+
+
+  if __name__ == "__main__":
+      main()
+
+----
+
+Achieved Effect
+~~~~~~~~~~~~~~~~
+
+- Run ``python emotiv_bridge.py --ui-only`` and open ``http://localhost:8080`` in a browser on
+  the same computer. Click **Forward / Back / Left / Right / Stop** (or use the arrow keys) and
+  the spider walks, turns, and stops — no headset required. This confirms the Wi-Fi and servo
+  path.
+
+- With a trained EMOTIV profile loaded, run ``python emotiv_bridge.py`` and *think* the trained
+  actions (push / pull / left / right / neutral) to drive the spider. The browser buttons keep
+  working as a manual override.
+
+- The forward gait is from Course 3; the backward and turn gaits are starting points you can
+  fine-tune (see the ``TURN_DAMP`` / ``LEFT_H_SERVOS`` settings in the sketch and the servo
+  calibration page).
+
+----
